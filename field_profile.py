@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import unicodedata
 
@@ -24,7 +25,9 @@ DEFAULT_COLUMN_VALUES: dict[str, str] = {
 
 
 def normalize_text(value: object) -> str:
-    if pd.isna(value):
+    if value is None or value is pd.NA or value is pd.NaT:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
         return ""
 
     text = str(value)

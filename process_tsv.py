@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 import re
 import time
 import unicodedata
+import warnings
 
 import pandas as pd
 
@@ -210,6 +212,9 @@ def read_tsv(path: Path, encoding: str = "utf-8-sig") -> pd.DataFrame:
     return pd.read_csv(path, sep="\t", dtype=str, encoding=encoding, keep_default_na=False)
 
 
+EXCEL_SUFFIXES = {".xlsx", ".xlsm", ".xls", ".xlsb"}
+
+
 _MODEL_COMBO_CACHE: dict[Path, dict[tuple[str, str], str]] = {}
 
 
@@ -253,7 +258,9 @@ def normalize_input_schema(df: pd.DataFrame, field_profile: dict[str, object] | 
 
 
 def normalize_text(value: object) -> str:
-    if pd.isna(value):
+    if value is None or value is pd.NA or value is pd.NaT:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
         return ""
 
     text = str(value)
@@ -262,6 +269,168 @@ def normalize_text(value: object) -> str:
     text = text.replace("\ufeff", "")
     text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
     return text.strip()
+
+
+def profile_input_config(field_profile: dict[str, object] | None) -> dict[str, object]:
+    profile = field_profile or {}
+    configured = profile.get("input", {})
+    if configured is None:
+        return {}
+    if not isinstance(configured, dict):
+        raise ValueError("Field profile 'input' must be a mapping.")
+    return configured
+
+
+def profile_input_path(field_profile: dict[str, object] | None) -> str:
+    config = profile_input_config(field_profile)
+    value = config.get("path", config.get("file", ""))
+    return normalize_text(value)
+
+
+def profile_input_sheets(field_profile: dict[str, object] | None) -> list[str]:
+    config = profile_input_config(field_profile)
+    value = config.get("sheets", config.get("sheet_names", config.get("tables", [])))
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [normalize_text(value)] if normalize_text(value) else []
+    if isinstance(value, (list, tuple)):
+        sheets: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                item = item.get("sheet", item.get("name", ""))
+            sheet = normalize_text(item)
+            if sheet:
+                sheets.append(sheet)
+        return sheets
+    raise ValueError("Field profile 'input.sheets' must be a string or list.")
+
+
+def resolve_input_path(
+    cli_input: Path | None,
+    field_profile: dict[str, object],
+    field_profile_path: Path | None,
+) -> Path:
+    if cli_input is not None:
+        return cli_input.resolve()
+
+    configured_path = profile_input_path(field_profile)
+    if not configured_path:
+        raise ValueError("Input file is required. Pass it as an argument or set input.path in --field-profile YAML.")
+
+    path = Path(configured_path)
+    if path.is_absolute():
+        return path.resolve()
+
+    base_dir = field_profile_path.parent if field_profile_path is not None else PROJECT_ROOT
+    return (base_dir / path).resolve()
+
+
+def resolve_excel_sheet_name(requested_sheet: str, available_sheets: list[str]) -> str:
+    normalized_available = {normalize_text(sheet): sheet for sheet in available_sheets}
+    normalized_requested = normalize_text(requested_sheet)
+    if normalized_requested in normalized_available:
+        return normalized_available[normalized_requested]
+
+    if normalized_requested.endswith("表"):
+        without_table_suffix = normalized_requested[:-1]
+        if without_table_suffix in normalized_available:
+            return normalized_available[without_table_suffix]
+
+    with_table_suffix = f"{normalized_requested}表"
+    if with_table_suffix in normalized_available:
+        return normalized_available[with_table_suffix]
+
+    available_text = "、".join(available_sheets)
+    raise ValueError(f"Excel sheet not found: {requested_sheet}. Available sheets: {available_text}")
+
+
+def drop_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    blank_mask = df.apply(lambda row: all(normalize_text(value) == "" for value in row), axis=1)
+    return df.loc[~blank_mask].reset_index(drop=True)
+
+
+def drop_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if not df.columns.has_duplicates:
+        return df
+    return df.loc[:, ~df.columns.duplicated()].copy()
+
+
+def read_excel_input(path: Path, sheet_names: list[str]) -> pd.DataFrame:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*extension is not supported.*", category=UserWarning)
+        excel_file_context = pd.ExcelFile(path)
+    with excel_file_context as excel_file:
+        if not sheet_names:
+            if len(excel_file.sheet_names) != 1:
+                available_text = "、".join(excel_file.sheet_names)
+                raise ValueError(
+                    f"Excel input has multiple sheets. Set input.sheets in YAML. Available sheets: {available_text}"
+                )
+            sheet_names = [excel_file.sheet_names[0]]
+
+        frames: list[pd.DataFrame] = []
+        for requested_sheet in sheet_names:
+            sheet_name = resolve_excel_sheet_name(requested_sheet, excel_file.sheet_names)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*extension is not supported.*", category=UserWarning)
+                frame = pd.read_excel(excel_file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
+            frame = drop_blank_rows(frame)
+            if not frame.empty:
+                frames.append(frame)
+            print(f"读取工作表: {sheet_name} ({len(frame)} rows)")
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def safe_path_part(value: object) -> str:
+    text = normalize_text(value)
+    text = re.sub(r'[<>:"/\\|?*]+', "_", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text or "sheet"
+
+
+def read_excel_input_tables(path: Path, sheet_names: list[str]) -> list[tuple[str, Path, pd.DataFrame]]:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*extension is not supported.*", category=UserWarning)
+        excel_file_context = pd.ExcelFile(path)
+    with excel_file_context as excel_file:
+        if not sheet_names:
+            if len(excel_file.sheet_names) != 1:
+                available_text = "、".join(excel_file.sheet_names)
+                raise ValueError(
+                    f"Excel input has multiple sheets. Set input.sheets in YAML. Available sheets: {available_text}"
+                )
+            sheet_names = [excel_file.sheet_names[0]]
+
+        tables: list[tuple[str, Path, pd.DataFrame]] = []
+        for requested_sheet in sheet_names:
+            sheet_name = resolve_excel_sheet_name(requested_sheet, excel_file.sheet_names)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*extension is not supported.*", category=UserWarning)
+                frame = pd.read_excel(excel_file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
+            frame = drop_blank_rows(frame)
+            table_stem = f"{path.stem}_{safe_path_part(sheet_name)}"
+            table_path = path.with_name(f"{table_stem}{path.suffix}")
+            tables.append((sheet_name, table_path, frame))
+            print(f"读取工作表: {sheet_name} ({len(frame)} rows)")
+    return tables
+
+
+def read_input_data(path: Path, encoding: str, field_profile: dict[str, object]) -> pd.DataFrame:
+    if path.suffix.lower() in EXCEL_SUFFIXES:
+        return read_excel_input(path, profile_input_sheets(field_profile))
+    return read_tsv(path, encoding=encoding)
+
+
+def read_input_tables(path: Path, encoding: str, field_profile: dict[str, object]) -> list[tuple[str, Path, pd.DataFrame]]:
+    if path.suffix.lower() in EXCEL_SUFFIXES:
+        return read_excel_input_tables(path, profile_input_sheets(field_profile))
+    return [(path.stem, path, read_tsv(path, encoding=encoding))]
 
 
 def parse_year_list(value: object) -> list[int]:
@@ -1814,6 +1983,7 @@ def transform_non_pickup(
             BACKSIZE_SOURCE_COLUMN: "BackSize",
         }
     )
+    renamed = drop_duplicate_columns(renamed)
 
     renamed = renamed[
         ["BRAND", "MODEL", "START_YEAR", "YEAR_SINGLE", "Const", "VERSION_RAW", "BackSize"]
@@ -2390,6 +2560,7 @@ def transform_pickup(
             BACKSIZE_SOURCE_COLUMN: "BackSize",
         }
     )
+    renamed = drop_duplicate_columns(renamed)
 
     for column in [
         "主车型",
@@ -2739,8 +2910,13 @@ def write_outputs(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert a TSV file using pandas.")
-    parser.add_argument("input", type=Path, help="Path to the input TSV file.")
+    parser = argparse.ArgumentParser(description="Compress fitment size data from TSV or configured Excel sheets.")
+    parser.add_argument(
+        "input",
+        type=Path,
+        nargs="?",
+        help="Path to the input TSV/Excel file. Can be omitted when --field-profile YAML sets input.path.",
+    )
     parser.add_argument(
         "-o",
         "--output-dir",
@@ -2757,7 +2933,7 @@ def parse_args() -> argparse.Namespace:
         "--field-profile",
         type=Path,
         default=None,
-        help="YAML file that maps input column names to the script's standard fields.",
+        help="YAML file that maps input column names and can optionally set input.path/input.sheets.",
     )
     parser.add_argument(
         "--remove-null-size",
@@ -2785,58 +2961,63 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    input_path = args.input.resolve()
+    field_profile_path = args.field_profile.resolve() if args.field_profile else None
+    field_profile = load_field_profile(field_profile_path)
+    input_path = resolve_input_path(args.input, field_profile, field_profile_path)
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    field_profile = load_field_profile(args.field_profile.resolve() if args.field_profile else None)
-    df = read_tsv(input_path, encoding=args.encoding)
-    progress = ProgressReporter(interval_seconds=args.progress_interval, enabled=not args.no_progress)
-    (
-        non_pickup_lossless_df,
-        non_pickup_high_df,
-        non_pickup_higher_df,
-        pickup_lossless_df,
-        pickup_specificity_df,
-        log_df,
-        atom_df,
-    ) = transform_all_outputs(
-        df,
-        remove_null_size=args.remove_null_size,
-        progress=progress,
-        field_profile=field_profile,
-    )
-    output_paths = write_outputs(
-        non_pickup_lossless_df,
-        non_pickup_high_df,
-        non_pickup_higher_df,
-        pickup_lossless_df,
-        pickup_specificity_df,
-        log_df,
-        atom_df,
-        input_path,
-        args.output_dir,
-        check_atom=args.check_atom,
-        progress=progress,
-    )
+    input_tables = read_input_tables(input_path, encoding=args.encoding, field_profile=field_profile)
+    for table_index, (table_name, table_path, df) in enumerate(input_tables, start=1):
+        if len(input_tables) > 1:
+            print(f"\n处理工作表 {table_index}/{len(input_tables)}: {table_name}")
+        progress = ProgressReporter(interval_seconds=args.progress_interval, enabled=not args.no_progress)
+        (
+            non_pickup_lossless_df,
+            non_pickup_high_df,
+            non_pickup_higher_df,
+            pickup_lossless_df,
+            pickup_specificity_df,
+            log_df,
+            atom_df,
+        ) = transform_all_outputs(
+            df,
+            remove_null_size=args.remove_null_size,
+            progress=progress,
+            field_profile=field_profile,
+        )
+        output_paths = write_outputs(
+            non_pickup_lossless_df,
+            non_pickup_high_df,
+            non_pickup_higher_df,
+            pickup_lossless_df,
+            pickup_specificity_df,
+            log_df,
+            atom_df,
+            table_path,
+            args.output_dir,
+            check_atom=args.check_atom,
+            progress=progress,
+        )
 
-    print("写入完成")
-    print(f"Output dir: {output_paths['output_dir']}")
-    if "non_pickup_lossless_tsv" in output_paths:
-        print(f"Non-pickup lossless TSV: {output_paths['non_pickup_lossless_tsv']}")
-        print(f"Non-pickup high TSV: {output_paths['non_pickup_higher_tsv']}")
-    if "pickup_lossless_tsv" in output_paths:
-        print(f"Pickup lossless TSV: {output_paths['pickup_lossless_tsv']}")
-        print(f"Pickup high TSV: {output_paths['pickup_higher_tsv']}")
-    print(f"Log TSV: {output_paths['log_tsv']}")
-    print(f"Atom TSV: {output_paths['atom_tsv']}")
-    if args.check_atom:
-        if "non_pickup_check_tsv" in output_paths:
-            print(f"Non-pickup atom check TSV: {output_paths['non_pickup_check_tsv']}")
-        if "pickup_check_tsv" in output_paths:
-            print(f"Pickup atom check TSV: {output_paths['pickup_check_tsv']}")
-    print(f"Excel: {output_paths['xlsx']}")
+        print("写入完成")
+        print(f"Input table: {table_name}")
+        print(f"Output dir: {output_paths['output_dir']}")
+        if "non_pickup_lossless_tsv" in output_paths:
+            print(f"Non-pickup lossless TSV: {output_paths['non_pickup_lossless_tsv']}")
+            print(f"Non-pickup high TSV: {output_paths['non_pickup_higher_tsv']}")
+        if "pickup_lossless_tsv" in output_paths:
+            print(f"Pickup lossless TSV: {output_paths['pickup_lossless_tsv']}")
+            print(f"Pickup high TSV: {output_paths['pickup_higher_tsv']}")
+        print(f"Log TSV: {output_paths['log_tsv']}")
+        print(f"Atom TSV: {output_paths['atom_tsv']}")
+        if args.check_atom:
+            if "non_pickup_check_tsv" in output_paths:
+                print(f"Non-pickup atom check TSV: {output_paths['non_pickup_check_tsv']}")
+            if "pickup_check_tsv" in output_paths:
+                print(f"Pickup atom check TSV: {output_paths['pickup_check_tsv']}")
+        print(f"Excel: {output_paths['xlsx']}")
 
 
 if __name__ == "__main__":
