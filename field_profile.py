@@ -145,14 +145,18 @@ def apply_field_profile(df: pd.DataFrame, profile: dict[str, object] | None = No
         if not join_columns or not all(join_column in work.columns for join_column in join_columns):
             continue
         sep = normalize_text(rule.get("sep", " "))
-        work[column] = work.apply(
-            lambda row: sep.join(
-                part
-                for part in [normalize_text(row.get(join_column, "")) for join_column in join_columns]
-                if part
-            ),
-            axis=1,
-        )
+        if work.empty:
+            work[column] = work.apply(
+                lambda row: sep.join(
+                    part
+                    for part in [normalize_text(row.get(join_column, "")) for join_column in join_columns]
+                    if part
+                ),
+                axis=1,
+            )
+            continue
+        parts = [work[join_column].map(normalize_text) for join_column in join_columns]
+        work[column] = [sep.join(part for part in values if part) for values in zip(*parts)]
 
     for column, value in _profile_default_values(profile).items():
         if column not in work.columns:

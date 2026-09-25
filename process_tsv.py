@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from functools import lru_cache
 import math
 from pathlib import Path
 import re
@@ -12,10 +14,7 @@ import pandas as pd
 
 from check_atom import build_atom_check
 from field_profile import apply_field_profile, load_field_profile
-from non_pickup_validation import (
-    non_pickup_atoms_in_record_scope,
-    non_pickup_candidate_validation_reason,
-)
+from non_pickup_validation import NonPickupMergeValidator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -219,8 +218,12 @@ _MODEL_COMBO_CACHE: dict[Path, dict[tuple[str, str], str]] = {}
 
 
 def load_model_combo_map(path: Path = DEFAULT_MODEL_COMBO_PATH) -> dict[tuple[str, str], str]:
+    if path in _MODEL_COMBO_CACHE:
+        return _MODEL_COMBO_CACHE[path]
+    requested = path
     path = path.resolve()
     if path in _MODEL_COMBO_CACHE:
+        _MODEL_COMBO_CACHE[requested] = _MODEL_COMBO_CACHE[path]
         return _MODEL_COMBO_CACHE[path]
     if not path.exists():
         _MODEL_COMBO_CACHE[path] = {}
@@ -243,6 +246,7 @@ def load_model_combo_map(path: Path = DEFAULT_MODEL_COMBO_PATH) -> dict[tuple[st
         for model in models:
             mapping[(make.casefold(), model.casefold())] = group_key
     _MODEL_COMBO_CACHE[path] = mapping
+    _MODEL_COMBO_CACHE[requested] = mapping
     return mapping
 
 
@@ -258,12 +262,17 @@ def normalize_input_schema(df: pd.DataFrame, field_profile: dict[str, object] | 
 
 
 def normalize_text(value: object) -> str:
+    if isinstance(value, str):
+        return _normalize_str(value)
     if value is None or value is pd.NA or value is pd.NaT:
         return ""
     if isinstance(value, float) and math.isnan(value):
         return ""
+    return _normalize_str(str(value))
 
-    text = str(value)
+
+@lru_cache(maxsize=1 << 20)
+def _normalize_str(text: str) -> str:
     text = text.replace("\u00a0", " ")
     text = text.replace("\u200b", "")
     text = text.replace("\ufeff", "")
@@ -1182,11 +1191,12 @@ def build_non_pickup_lossless_new(atoms: pd.DataFrame) -> pd.DataFrame:
     records: list[dict[str, object]] = []
     group_keys = ["BRAND", "MODEL", "BackSize", "Const", "VERSION_RAW"]
     atoms = atoms.sort_values(["BRAND", "MODEL", "START_YEAR", "YEAR_SINGLE"], kind="mergesort")
-    for key_values, group in atoms.groupby(group_keys, dropna=False, sort=False):
-        brand, model, backsize, const, version = (
-            normalize_text(value) for value in (key_values if isinstance(key_values, tuple) else (key_values,))
-        )
-        years = sorted(set(group["YEAR_SINGLE"].astype(int)))
+    group_years: dict[tuple[object, ...], set[int]] = {}
+    for *key_values, year in zip(*(atoms[column] for column in group_keys), atoms["YEAR_SINGLE"]):
+        group_years.setdefault(tuple(key_values), set()).add(int(year))
+    for key_values, year_set in group_years.items():
+        brand, model, backsize, const, version = (normalize_text(value) for value in key_values)
+        years = sorted(year_set)
         for start, end in continuous_year_segments(years):
             records.append(make_non_pickup_output_record(brand, model, start, end, backsize, const, version))
 
@@ -1224,8 +1234,14 @@ def build_non_pickup_high_new(
     output_groups: list[pd.DataFrame] = []
     lossless_work = lossless.copy()
     atoms_work = atoms.copy()
-    lossless_work["__MODEL_GROUP"] = lossless_work.apply(lambda row: model_combo_group(row["BRAND"], row["MODEL"]), axis=1)
-    atoms_work["__MODEL_GROUP"] = atoms_work.apply(lambda row: model_combo_group(row["BRAND"], row["MODEL"]), axis=1)
+    lossless_work["__MODEL_GROUP"] = [model_combo_group(brand, model) for brand, model in zip(lossless_work["BRAND"], lossless_work["MODEL"])]
+    atoms_work["__MODEL_GROUP"] = [model_combo_group(brand, model) for brand, model in zip(atoms_work["BRAND"], atoms_work["MODEL"])]
+    atom_positions: dict[tuple[str, str], list[int]] = {}
+    for position, atom_key in enumerate(
+        zip(atoms_work["BRAND"].map(normalize_text), atoms_work["__MODEL_GROUP"].map(normalize_text))
+    ):
+        atom_positions.setdefault(atom_key, []).append(position)
+    atom_records = atoms_work.drop(columns=["__MODEL_GROUP"]).to_dict("records")
     total_groups = int(lossless_work.groupby(["BRAND", "__MODEL_GROUP"], dropna=False, sort=False).ngroups)
     completed_groups = 0
     merge_count = 0
@@ -1238,40 +1254,29 @@ def build_non_pickup_high_new(
         key_stats = stats.setdefault(key, {"attempts": 0, "successes": 0, "fallbacks": 0})
         if progress:
             progress.update(current_make=key[0], current_model=key[1], completed_models=completed_groups)
-        atoms_group = atoms_work[
-            (atoms_work["BRAND"].map(normalize_text) == key[0])
-            & (atoms_work["__MODEL_GROUP"].map(normalize_text) == key[1])
-        ].drop(columns=["__MODEL_GROUP"])
+        validator = NonPickupMergeValidator([atom_records[position] for position in atom_positions.get(key, [])])
         group = group.drop(columns=["__MODEL_GROUP"])
         working = group.sort_values(["START_YEAR", "year_start", "year_end", "MODEL", "BACKSIZE", "CONST", "VERSION"], kind="mergesort").reset_index(drop=True)
+        # 两两尝试在纯 Python 记录上进行；只有合并成功时才重建 DataFrame 并排序。
+        records = working.to_dict("records")
+        validator.reset(records)
+        merged_any = False
 
         changed = True
-        while changed and len(working) > 1:
+        while changed and len(records) > 1:
             changed = False
-            for left_index in range(len(working)):
+            for left_index in range(len(records)):
                 if changed:
                     break
-                for right_index in range(left_index + 1, len(working)):
-                    left = working.iloc[left_index]
-                    right = working.iloc[right_index]
+                for right_index in range(left_index + 1, len(records)):
+                    left = records[left_index]
+                    right = records[right_index]
                     if normalize_text(left.get("BACKSIZE", "")) != normalize_text(right.get("BACKSIZE", "")):
                         continue
                     key_stats["attempts"] += 1
                     attempt_count += 1
                     merged = merge_non_pickup_high_records(left, right)
-                    candidate_rows = [
-                        *working.iloc[:left_index].to_dict("records"),
-                        *working.iloc[left_index + 1 : right_index].to_dict("records"),
-                        *working.iloc[right_index + 1 :].to_dict("records"),
-                        merged,
-                    ]
-                    candidate = pd.DataFrame(candidate_rows, columns=working.columns)
-                    scoped_atoms = non_pickup_atoms_in_record_scope(atoms_group, merged)
-                    reason = (
-                        "候选合并范围内没有可验证原子事实"
-                        if scoped_atoms.empty
-                        else non_pickup_candidate_validation_reason(candidate, scoped_atoms)
-                    )
+                    reason = validator.merge_reason(left_index, right_index, merged)
                     log_base = {
                         "压缩类型": "非皮卡",
                         "阶段": "高度压缩两两组合",
@@ -1287,9 +1292,19 @@ def build_non_pickup_high_new(
                         log_rows.append({**log_base, "结果": "success", "原因": ""})
                         if progress:
                             progress.update(merge_count=merge_count, attempt_count=attempt_count)
-                        working = candidate.sort_values(
-                            ["START_YEAR", "year_start", "year_end", "BACKSIZE", "CONST", "VERSION"], kind="mergesort"
-                        ).reset_index(drop=True)
+                        candidate_rows = [
+                            *records[:left_index],
+                            *records[left_index + 1 : right_index],
+                            *records[right_index + 1 :],
+                            {column: merged[column] for column in working.columns},
+                        ]
+                        # 稳定排序，等价于 DataFrame.sort_values(kind="mergesort")
+                        records = sorted(
+                            candidate_rows,
+                            key=lambda row: (row["START_YEAR"], row["year_start"], row["year_end"], row["BACKSIZE"], row["CONST"], row["VERSION"]),
+                        )
+                        validator.reset(records)
+                        merged_any = True
                         changed = True
                         break
                     key_stats["fallbacks"] += 1
@@ -1297,6 +1312,8 @@ def build_non_pickup_high_new(
                     if progress:
                         progress.update(merge_count=merge_count, attempt_count=attempt_count)
 
+        if merged_any:
+            working = pd.DataFrame(records, columns=working.columns)
         output_groups.append(working)
         completed_groups += 1
         if progress:
@@ -1957,7 +1974,7 @@ def transform_non_pickup(
     work = work.explode("MODEL_LIST")
     work["前台车型"] = work["MODEL_LIST"].map(normalize_text)
     work = work.drop(columns=["MODEL_LIST"])
-    work["START_YEAR"] = work.apply(lambda row: resolve_start_year(row.get("开始年", ""), row.get("年份区间", "")), axis=1)
+    work["START_YEAR"] = [resolve_start_year(start, year_range) for start, year_range in zip(work["开始年"], work["年份区间"])]
     if work["START_YEAR"].isna().any():
         bad_count = int(work["START_YEAR"].isna().sum())
         raise ValueError(f"非皮卡存在 {bad_count} 行无法解析开始年，请检查开始年或年份区间。")
@@ -2002,16 +2019,10 @@ def transform_non_pickup(
     higher_internal, merge_stats, compression_log = build_non_pickup_high_new(lossless_internal, renamed, progress=progress)
     atom_table = build_non_pickup_atom_table(renamed)
     process_rows: list[dict[str, object]] = []
-    for (brand, model), atoms_group in renamed.groupby(["BRAND", "MODEL"], dropna=False, sort=False):
+    lossless_counts = Counter(zip(lossless_internal["BRAND"].map(normalize_text), lossless_internal["MODEL"].map(normalize_text)))
+    higher_counts = Counter(zip(higher_internal["BRAND"].map(normalize_text), higher_internal["MODEL"].map(normalize_text)))
+    for (brand, model), atom_count in renamed.groupby(["BRAND", "MODEL"], dropna=False, sort=False).size().items():
         key = (normalize_text(brand), normalize_text(model))
-        lossless_group = lossless_internal[
-            (lossless_internal["BRAND"].map(normalize_text) == key[0])
-            & (lossless_internal["MODEL"].map(normalize_text) == key[1])
-        ]
-        higher_group = higher_internal[
-            (higher_internal["BRAND"].map(normalize_text) == key[0])
-            & (higher_internal["MODEL"].map(normalize_text) == key[1])
-        ]
         stats = merge_stats.get(key, {})
         fallback_count = int(stats.get("fallbacks", 0))
         risks = ["存在组合验证失败，已fallback"] if fallback_count else []
@@ -2021,10 +2032,10 @@ def transform_non_pickup(
                 "BRAND": key[0],
                 "MODEL": key[1],
                 "原始行数": int(renamed.attrs.get("raw_counts", {}).get(key, 0)),
-                "原子事实数": int(len(atoms_group)),
-                "无损年份行数": int(len(lossless_group)),
+                "原子事实数": int(atom_count),
+                "无损年份行数": int(lossless_counts[key]),
                 "无损年份结构行数": "",
-                "特定性行数": int(len(higher_group)),
+                "特定性行数": int(higher_counts[key]),
                 "相邻合并尝试次数": int(stats.get("attempts", 0)),
                 "相邻合并成功次数": int(stats.get("successes", 0)),
                 "相邻合并Fallback次数": fallback_count,
@@ -2141,6 +2152,137 @@ def pickup_candidate_validation_reason(rows: pd.DataFrame, atoms: pd.DataFrame) 
     return ""
 
 
+@lru_cache(maxsize=1 << 16)
+def _bed_matches_cached(bed_text: str, expression_text: str) -> bool:
+    return bed_matches_expression(bed_text, expression_text)
+
+
+def _pickup_record_profile(record: object) -> tuple:
+    """pickup_record_matches_atom_scope 用到的记录字段，预先解析成可哈希元组。"""
+    model = record.get("MODEL", "")
+    version = normalize_text(record.get("VERSION", ""))
+    cab_text = normalize_text(record.get("CAB", ""))
+    return (
+        normalize_text(record.get("BRAND", "")),
+        normalize_text(model),
+        tuple(split_model_expression(model)),
+        version,
+        version.lower().startswith("incl:"),
+        frozenset(split_version_tokens(version)),
+        cab_text,
+        frozenset(split_joined_text(cab_text)),
+        frozenset(parse_year_list(record.get("YEAR", ""))),
+        normalize_text(record.get("BED_FT", "")),
+    )
+
+
+def _pickup_atom_profile(atom: dict[str, object]) -> tuple:
+    version = normalize_text(atom.get("VERSION_RAW", ""))
+    return (
+        normalize_text(atom.get("BRAND", "")),
+        normalize_text(atom.get("MODEL", "")),
+        version,
+        frozenset(split_version_tokens(version)),
+        normalize_text(atom.get("CAB", "")),
+        int(atom["YEAR_SINGLE"]),
+        normalize_text(atom.get("BED_FT", "")),
+        normalize_text(atom.get("BackSize", "")),
+    )
+
+
+def _pickup_profile_matches(record: tuple, atom: tuple) -> bool:
+    """等价于 pickup_record_matches_atom_scope(record, atom)。"""
+    brand, model, models, version, incl, version_tokens, cab_text, cab_set, years, bed = record
+    atom_brand, atom_model, atom_version, atom_tokens, atom_cab, atom_year, atom_bed, _ = atom
+    if brand != atom_brand:
+        return False
+    if model != atom_model and (atom_model not in models if models else atom_model != ""):
+        return False
+    if not version:
+        if atom_version != "":
+            return False
+    elif not ((incl and atom_version == "") or atom_version in version_tokens or atom_tokens & version_tokens):
+        return False
+    if cab_text and atom_cab not in cab_set:
+        return False
+    if not cab_text and atom_cab:
+        return False
+    if atom_year not in years:
+        return False
+    return _bed_matches_cached(atom_bed, bed)
+
+
+class PickupMergeValidator:
+    """两两合并的增量校验，结果与 pickup_candidate_validation_reason(candidate, atoms) 完全一致。
+
+    候选 = working 去掉左右两条再加合并记录，只有被这三条命中的原子状态会变化；
+    其余原子沿用 working 的基线状态，取原子顺序上第一个失败的原因。"""
+
+    def __init__(self, atoms: list[dict[str, object]]) -> None:
+        self.atoms = [_pickup_atom_profile(atom) for atom in atoms]
+        self._atoms_by_year: dict[int, list[int]] = {}
+        for index, atom in enumerate(self.atoms):
+            self._atoms_by_year.setdefault(atom[5], []).append(index)
+        self._matched_cache: dict[tuple, tuple[int, ...]] = {}
+        self.record_sets: list[frozenset[int]] = []
+        self.record_sizes: list[str] = []
+        self.matches: dict[int, list[int]] = {}
+        self.base_failures: list[tuple[int, str]] = []
+
+    def matched_atoms(self, record: object) -> tuple[int, ...]:
+        profile = _pickup_record_profile(record)
+        cached = self._matched_cache.get(profile)
+        if cached is None:
+            candidates = sorted(index for year in profile[8] for index in self._atoms_by_year.get(year, ()))
+            cached = tuple(index for index in candidates if _pickup_profile_matches(profile, self.atoms[index]))
+            self._matched_cache[profile] = cached
+        return cached
+
+    @staticmethod
+    def _reason(matched_sizes: list[str], atom_size: str) -> str:
+        if len(matched_sizes) > 1:
+            return "原子事实对应多条候选记录"
+        if not matched_sizes:
+            return "原子事实未被候选记录覆盖"
+        if matched_sizes[0] != atom_size:
+            return "原子事实命中不同尺码候选记录"
+        return ""
+
+    def reset(self, records: list[dict[str, object]]) -> None:
+        self.record_sets = [frozenset(self.matched_atoms(record)) for record in records]
+        self.record_sizes = [normalize_text(record.get("BACKSIZE", "")) for record in records]
+        self.matches = {}
+        for position, matched in enumerate(self.record_sets):
+            for index in matched:
+                self.matches.setdefault(index, []).append(position)
+        self.base_failures = []
+        for index, atom in enumerate(self.atoms):
+            sizes = [self.record_sizes[position] for position in self.matches.get(index, ())]
+            reason = self._reason(sizes, atom[7])
+            if reason:
+                self.base_failures.append((index, reason))
+
+    def merge_reason(self, left_index: int, right_index: int, merged: dict[str, object]) -> str:
+        merged_set = frozenset(self.matched_atoms(merged))
+        merged_size = normalize_text(merged.get("BACKSIZE", ""))
+        affected = self.record_sets[left_index] | self.record_sets[right_index] | merged_set
+        first_unaffected = next(((index, reason) for index, reason in self.base_failures if index not in affected), None)
+        for index in sorted(affected):
+            if first_unaffected is not None and index > first_unaffected[0]:
+                break
+            sizes = [
+                self.record_sizes[position]
+                for position in self.matches.get(index, ())
+                if position != left_index and position != right_index
+            ]
+            if index in merged_set:
+                sizes.append(merged_size)
+            reason = self._reason(sizes, self.atoms[index][7])
+            if reason:
+                return reason
+        return first_unaffected[1] if first_unaffected is not None else ""
+
+
 def pickup_internal_from_lossless(lossless: pd.DataFrame) -> pd.DataFrame:
     if lossless.empty:
         return pd.DataFrame(columns=[*PICKUP_FINAL_COLUMNS, "VERSION_RAW", "BackSize", "_year_start", "_year_end"])
@@ -2201,9 +2343,15 @@ def build_pickup_high_from_lossless(
 
     output_groups: list[pd.DataFrame] = []
     work_source = pickup_internal_from_lossless(lossless)
-    work_source["__MODEL_GROUP"] = work_source.apply(lambda row: model_combo_group(row["BRAND"], row["MODEL"]), axis=1)
+    work_source["__MODEL_GROUP"] = [model_combo_group(brand, model) for brand, model in zip(work_source["BRAND"], work_source["MODEL"])]
     atoms_work = atoms.copy()
-    atoms_work["__MODEL_GROUP"] = atoms_work.apply(lambda row: model_combo_group(row["BRAND"], row["MODEL"]), axis=1)
+    atoms_work["__MODEL_GROUP"] = [model_combo_group(brand, model) for brand, model in zip(atoms_work["BRAND"], atoms_work["MODEL"])]
+    atom_positions: dict[tuple[str, str], list[int]] = {}
+    for position, atom_key in enumerate(
+        zip(atoms_work["BRAND"].map(normalize_text), atoms_work["__MODEL_GROUP"].map(normalize_text))
+    ):
+        atom_positions.setdefault(atom_key, []).append(position)
+    atom_records = atoms_work.drop(columns=["__MODEL_GROUP"]).to_dict("records")
     total_groups = int(work_source.groupby(["BRAND", "__MODEL_GROUP"], dropna=False, sort=False).ngroups)
     completed_groups = 0
     merge_count = 0
@@ -2219,21 +2367,23 @@ def build_pickup_high_from_lossless(
         )
         if progress:
             progress.update(current_make=brand, current_model=model_group, completed_models=completed_groups)
-        atoms_group = atoms_work[
-            (atoms_work["BRAND"].map(normalize_text) == normalize_text(brand))
-            & (atoms_work["__MODEL_GROUP"].map(normalize_text) == normalize_text(model_group))
-        ].drop(columns=["__MODEL_GROUP"])
+        validator = PickupMergeValidator(
+            [atom_records[position] for position in atom_positions.get((normalize_text(brand), normalize_text(model_group)), [])]
+        )
         working = group.sort_values(["_year_start", "_year_end", "VERSION", "CAB", "BED_FT", "BACKSIZE"], kind="mergesort").reset_index(drop=True)
+        # 两两尝试在纯 Python 记录上进行；只有合并成功时才重建 DataFrame 并排序。
+        records = working.to_dict("records")
+        validator.reset(records)
 
         changed = True
-        while changed and len(working) > 1:
+        while changed and len(records) > 1:
             changed = False
-            for left_index in range(len(working)):
+            for left_index in range(len(records)):
                 if changed:
                     break
-                for right_index in range(left_index + 1, len(working)):
-                    left = working.iloc[left_index]
-                    right = working.iloc[right_index]
+                for right_index in range(left_index + 1, len(records)):
+                    left = records[left_index]
+                    right = records[right_index]
                     if normalize_text(left.get("BACKSIZE", "")) != normalize_text(right.get("BACKSIZE", "")):
                         continue
                     model_stats["bed_merge_attempts"] += 1
@@ -2249,23 +2399,24 @@ def build_pickup_high_from_lossless(
                         **candidate_log_fields(left, right, merged, include_const=False),
                     }
 
-                    candidate_rows = [
-                        *working.iloc[:left_index].to_dict("records"),
-                        *working.iloc[left_index + 1 : right_index].to_dict("records"),
-                        *working.iloc[right_index + 1 :].to_dict("records"),
-                        merged,
-                    ]
-                    candidate = pd.DataFrame(candidate_rows, columns=working.columns)
-                    reason = pickup_candidate_validation_reason(candidate, atoms_group)
+                    reason = validator.merge_reason(left_index, right_index, merged)
                     if not reason:
                         model_stats["bed_merge_successes"] += 1
                         merge_count += 1
                         log_rows.append({**log_base, "结果": "success", "原因": ""})
                         if progress:
                             progress.update(merge_count=merge_count, attempt_count=attempt_count)
-                        working = candidate.sort_values(
+                        candidate_rows = [
+                            *records[:left_index],
+                            *records[left_index + 1 : right_index],
+                            *records[right_index + 1 :],
+                            merged,
+                        ]
+                        working = pd.DataFrame(candidate_rows, columns=working.columns).sort_values(
                             ["_year_start", "_year_end", "VERSION", "CAB", "BED_FT", "BACKSIZE"], kind="mergesort"
                         ).reset_index(drop=True)
+                        records = working.to_dict("records")
+                        validator.reset(records)
                         changed = True
                         break
                     model_stats["bed_merge_fallbacks"] += 1
@@ -2812,6 +2963,7 @@ def write_outputs(
     output_dir: Path,
     check_atom: bool = False,
     progress: ProgressReporter | None = None,
+    write_xlsx: bool = True,
 ) -> dict[str, Path]:
     stem = input_path.stem
     project_output_dir = output_dir / stem
@@ -2873,27 +3025,27 @@ def write_outputs(
             )
             pickup_check_df.to_csv(pickup_check_tsv_path, sep="\t", index=False, encoding="utf-8-sig")
 
-    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
-        if not non_pickup_lossless_df.empty:
-            export_non_pickup_table(non_pickup_lossless_df).to_excel(writer, sheet_name="非皮卡无损", index=False)
-            export_non_pickup_table(non_pickup_higher_df).to_excel(writer, sheet_name="非皮卡高度", index=False)
-        if not pickup_lossless_df.empty:
-            export_pickup_table(pickup_lossless_df).to_excel(writer, sheet_name="皮卡无损", index=False)
-            export_pickup_table(pickup_specificity_df).to_excel(writer, sheet_name="皮卡高度", index=False)
-        export_table(log_df).to_excel(writer, sheet_name="压缩log", index=False)
-        export_table(atom_df).to_excel(writer, sheet_name="原子事实表", index=False)
-        if check_atom and not non_pickup_check_df.empty:
-            non_pickup_check_df.to_excel(writer, sheet_name="非皮卡原子检查", index=False)
-        if check_atom and not pickup_check_df.empty:
-            pickup_check_df.to_excel(writer, sheet_name="皮卡原子检查", index=False)
+    if write_xlsx:
+        write_xlsx_output(
+            xlsx_path,
+            non_pickup_lossless_df,
+            non_pickup_higher_df,
+            pickup_lossless_df,
+            pickup_specificity_df,
+            log_df,
+            atom_df,
+            non_pickup_check_df if check_atom else pd.DataFrame(),
+            pickup_check_df if check_atom else pd.DataFrame(),
+        )
 
     paths = {
         "output_dir": project_output_dir,
         "compress_dir": compress_dir,
         "log_tsv": log_tsv_path,
         "atom_tsv": atom_tsv_path,
-        "xlsx": xlsx_path,
     }
+    if write_xlsx:
+        paths["xlsx"] = xlsx_path
     if check_atom:
         paths["check_dir"] = check_dir
         if not non_pickup_check_df.empty:
@@ -2907,6 +3059,32 @@ def write_outputs(
         paths["pickup_lossless_tsv"] = pickup_lossless_tsv_path
         paths["pickup_higher_tsv"] = pickup_specificity_tsv_path
     return paths
+
+
+def write_xlsx_output(
+    xlsx_path: Path,
+    non_pickup_lossless_df: pd.DataFrame,
+    non_pickup_higher_df: pd.DataFrame,
+    pickup_lossless_df: pd.DataFrame,
+    pickup_specificity_df: pd.DataFrame,
+    log_df: pd.DataFrame,
+    atom_df: pd.DataFrame,
+    non_pickup_check_df: pd.DataFrame,
+    pickup_check_df: pd.DataFrame,
+) -> None:
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        if not non_pickup_lossless_df.empty:
+            export_non_pickup_table(non_pickup_lossless_df).to_excel(writer, sheet_name="非皮卡无损", index=False)
+            export_non_pickup_table(non_pickup_higher_df).to_excel(writer, sheet_name="非皮卡高度", index=False)
+        if not pickup_lossless_df.empty:
+            export_pickup_table(pickup_lossless_df).to_excel(writer, sheet_name="皮卡无损", index=False)
+            export_pickup_table(pickup_specificity_df).to_excel(writer, sheet_name="皮卡高度", index=False)
+        export_table(log_df).to_excel(writer, sheet_name="压缩log", index=False)
+        export_table(atom_df).to_excel(writer, sheet_name="原子事实表", index=False)
+        if not non_pickup_check_df.empty:
+            non_pickup_check_df.to_excel(writer, sheet_name="非皮卡原子检查", index=False)
+        if not pickup_check_df.empty:
+            pickup_check_df.to_excel(writer, sheet_name="皮卡原子检查", index=False)
 
 
 def parse_args() -> argparse.Namespace:
@@ -2956,6 +3134,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable periodic progress output.",
     )
+    parser.add_argument(
+        "--no-xlsx",
+        action="store_true",
+        help="Skip the combined Excel workbook; only TSV outputs are written.",
+    )
     return parser.parse_args()
 
 
@@ -2999,6 +3182,7 @@ def main() -> None:
             args.output_dir,
             check_atom=args.check_atom,
             progress=progress,
+            write_xlsx=not args.no_xlsx,
         )
 
         print("写入完成")
@@ -3017,7 +3201,8 @@ def main() -> None:
                 print(f"Non-pickup atom check TSV: {output_paths['non_pickup_check_tsv']}")
             if "pickup_check_tsv" in output_paths:
                 print(f"Pickup atom check TSV: {output_paths['pickup_check_tsv']}")
-        print(f"Excel: {output_paths['xlsx']}")
+        if "xlsx" in output_paths:
+            print(f"Excel: {output_paths['xlsx']}")
 
 
 if __name__ == "__main__":
